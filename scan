@@ -1,0 +1,287 @@
+#!/usr/bin/env python
+
+import json
+import argparse
+import subprocess
+
+WRAPPERS = {
+    'stringify': lambda x: f'\x1E"{x.strip()}"\n'
+}
+
+VERBOSE=False
+
+
+def wrap_line(line, wrappers):
+    for w in wrappers:
+        line = w(line)
+    return line
+
+
+class Report:
+    def __init__(self, scenario):
+        self._scenario = scenario
+        self._html = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<meta name="color-scheme" content="light dark"/>
+<title>Evaluation report</title>
+<meta name="description" content="A pure HTML example, without dependencies."/>
+
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2.0.6/css/pico.min.css"/>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.colors.min.css"/>
+
+</head>
+<body>
+
+{header}
+
+<main class="container">
+{tests}
+</main>
+
+</body>
+</html>"""
+
+        self._header = """
+    <header class="container">
+      <h1>{scenario}</h1>
+      <h5>Evaluation report</h5>
+    </header>"""
+
+        self._test = """
+      <section id="preview">
+        <article id="article">
+        <details>
+          <summary><h3>{title}</h3></summary>
+          {blocks}
+        </details>
+        <br/>
+        <footer class="pico-background-{result_color}-500">
+          <b>{result}</b>
+        </footer>
+      </article></section>"""
+
+        self._block = """<h5>{title}</h5>
+        <pre>{command}</pre>
+        <small><pre>{findings}</pre></small>"""
+
+    def write(self):
+        with open(f"{self._scenario._id}.html", "w") as f:
+            header = self._header.format(scenario=self._scenario._title)
+            tests = []
+            for test in self._scenario._tests:
+                blocks = []
+                for block in test._blocks:
+                    blocks.append(self._block.format(title=block._title,
+                                                     command=" ".join([block._command] + block._arguments),
+                                                     findings=block.findings if block.is_successful() else block.errors))
+                if not test.failure:
+                    result = "FAIL" if test.have_findings else "PASS"
+                    result_color = "red" if test.have_findings else "green"
+                else:
+                    result = "ERROR"
+                    result_color = "grey"
+                tests.append(self._test.format(title=test._title, blocks="<hr/>\n".join(blocks),
+                                               result=result,
+                                               result_color=result_color))
+            html = self._html.format(header=header, tests="\n".join(tests))
+            f.write(html)
+
+
+class Block:
+    def __init__(self, block_json):
+        self._id = block_json['@id']
+        self._title = block_json['title']
+        self._command = block_json['command']
+        self._arguments = block_json['args']
+        self._wrappers = []
+        self._deps = block_json.get('deps', [])
+        self._rc_ok = block_json.get('rc_ok', [0])
+        self._in = block_json.get('in', [])
+        self.findings = ""
+        self.errors = ""
+        self.rc = 0
+        for wrapper in block_json.get('wrap', []):
+            fn = WRAPPERS.get(wrapper.lower())
+            if fn is not None:
+                self._wrappers.append(fn)
+
+    def get_deps(self):
+        for arg in self._arguments:
+            if arg.startswith('@'):
+                yield arg[1:]
+
+    def get_resolved_args(self):
+        for arg in self._arguments:
+            if arg.startswith('@'):
+                yield f"{arg[1:]}.json"
+            else:
+                yield arg
+
+    def is_successful(self):
+        return self.rc in self._rc_ok
+
+    def execute(self):
+        print(f"    Executing block '{self._title}' ({self._id}) ", end="")
+
+        cmd = [self._command] + list(self.get_resolved_args())
+
+        with subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, stdin=subprocess.PIPE, text=True) as proc:
+
+            proc_stdout, proc_stderr = proc.communicate("\n".join(self._in) if self._in else None)
+            rc = proc.returncode
+
+            print("✔" if rc in self._rc_ok else "✘")
+
+            output = ""
+            for line in proc_stdout.splitlines():
+                output += wrap_line(line, self._wrappers)
+            errors = proc_stderr
+
+            if VERBOSE:
+                print("    // " + " ".join(cmd))
+                print("    == OUT =============")
+                print(output, end="")
+                print("    ====================\n")
+                if rc not in self._rc_ok:
+                    print("    -- ERR -------------")
+                    print(errors, end="")
+                    print("    --------------------\n")
+
+            with open(f"{self._id}.json", "w") as f:
+                f.write(output)
+            with open(f"{self._id}.{rc}.log", "w") as f:
+                f.write(errors)
+
+            self.findings = output.strip()
+            self.errors = errors
+            self.rc = rc
+            return self.findings != "" and self.findings != "{}" and self.findings != "[]"
+
+    def __repr__(self):
+        return f"Block ({self._id}): command={repr(self._command)}, args={repr(self._arguments)}"
+
+
+class Test:
+    def __init__(self, test_json):
+        self._id = test_json['@id']
+        self._title = test_json['title']
+        self._blocks = []
+        self.have_findings = False
+        self.failure = False
+        blocks = []
+        for block in test_json['blocks']:
+            blocks.append(Block(block))
+        for block in blocks:
+            have_deps = True
+            for dep in block.get_deps():
+                if not self.have_dep(dep):
+                    have_deps = False
+            if have_deps:
+                self._blocks.append(block)
+
+    def get_pkg_deps(self):
+        deps = set()
+        cmds = set()
+        for block in self._blocks:
+            if block._deps:
+                deps.update(block._deps)
+            else:
+                cmds.update([block._command])
+
+        if cmds:
+            with subprocess.Popen(["rpm", "-qf"] + list(cmds), stdout=subprocess.PIPE) as proc:
+                deps.update([line.decode().strip() for line in proc.stdout])
+
+        return deps
+
+    def have_dep(self, dep):
+        for block in self._blocks:
+            if block._id == dep:
+                return True
+        return False
+
+    def execute(self):
+        print(f"Running test '{self._title}' ({self._id})...")
+        for block in self._blocks:
+            self.have_findings = block.execute()
+            if not block.is_successful():
+                self.failure = True
+                break
+
+    def __repr__(self):
+        return f"Test ({self._id}): blocks={repr(self._blocks)}"
+
+
+class Scenario:
+    def __init__(self, scenario_json):
+        self._id = scenario_json['@id']
+        self._title = scenario_json['title']
+        self._tests = []
+        print(f"Scenario: '{self._title}' ({self._id}).")
+        for test in scenario_json['tests']:
+            self._tests.append(Test(test))
+
+    def get_dependencies(self):
+        deps = set()
+        for test in self._tests:
+            deps.update(test.get_pkg_deps())
+        return deps
+
+    def execute(self):
+        for test in self._tests:
+            test.execute()
+
+    def __repr__(self):
+        return f"Scenario: tests={repr(self._tests)}"
+
+
+def load_scenario(file):
+    scenario_json = json.load(file)
+    return Scenario(scenario_json)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description="evaluates test scenarios")
+    parser.add_argument("command",
+                        metavar="COMMAND",
+                        choices=['eval', 'deps'],
+                        help="a sub-command to execute for a given scenario: eval, deps")
+    parser.add_argument("scenario",
+                        metavar="TEST_SCENARIO",
+                        help="a test scenario in JSON format")
+    parser.add_argument("-v", "--verbose", default=False,
+                        action='store_true',
+                        help="verbose output")
+    return parser
+
+
+def main():
+    global VERBOSE
+
+    parser = build_parser()
+    args = parser.parse_args()
+
+    VERBOSE = args.verbose
+
+    with open(args.scenario) as f:
+        scenario = load_scenario(f)
+
+        # if VERBOSE:
+        #    print(repr(scenario))
+
+        if args.command == 'eval':
+            scenario.execute()
+            r = Report(scenario)
+            r.write()
+
+        elif args.command == 'deps':
+            deps = scenario.get_dependencies()
+            print('Dependencies: ' + ' '.join(deps))
+
+
+if __name__ == '__main__':
+    main()
